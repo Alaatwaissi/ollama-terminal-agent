@@ -219,6 +219,12 @@ SHELL_META = re.compile(r"[;&|<>`$()\n]")
 
 ANNOUNCES_ACTION = re.compile(
     r"\b(I'll|I will|let's|let me(?! know)|I am going to|I'm going to|next,? I)\b", re.I)
+# If the reply also reads as a wrap-up or a report that the work is done, it is
+# finishing, not stalling, so don't nudge it to keep acting.
+CLOSING = re.compile(
+    r"(feel free|let me know|if you (need|have)|further (assistance|questions|help)|"
+    r"anything else|happy to help|you're welcome|hope (this|that)|"
+    r"\b(done|completed?|finished|successful(ly)?|all set|here (is|are|'s))\b)", re.I)
 
 HELP = """Commands:
   /help                 show this help
@@ -786,7 +792,9 @@ def chat(config, history, user_input):
             turn.append(reply)
             if not reply.get("tool_calls"):
                 # Small models often announce a step ("I'll create...") and stop.
-                if use_tools and nudges < 2 and ANNOUNCES_ACTION.search(reply["content"]):
+                content = reply["content"]
+                if use_tools and nudges < 2 and ANNOUNCES_ACTION.search(content) \
+                        and not CLOSING.search(content):
                     nudges += 1
                     print("[nudging the model to act]")
                     turn.append({"role": "user", "content": "Don't describe it, do it now: "
