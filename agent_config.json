@@ -25,34 +25,180 @@
     "web": {
       "description": "looking things up online: searching, news, prices, docs, websites",
       "model": "qwen2.5:3b",
-      "fallbacks": ["llama3.2:3b", "qwen2.5-coder:3b"],
+      "fallbacks": [
+        "llama3.2:3b",
+        "qwen2.5-coder:3b"
+      ],
       "tools": true,
-      "options": {"temperature": 0.3},
-      "keywords": ["search", "google", "internet", "web", "online", "look up", "lookup", "browse", "website", "url", "https?", "latest", "news", "weather", "price", "current", "today", "recent", "find out", "documentation", "docs"]
+      "options": {
+        "temperature": 0.3
+      },
+      "keywords": [
+        "search",
+        "google",
+        "internet",
+        "web",
+        "online",
+        "look up",
+        "lookup",
+        "browse",
+        "url",
+        "https?",
+        "latest",
+        "news",
+        "weather",
+        "price",
+        "current",
+        "today",
+        "recent",
+        "find out",
+        "documentation",
+        "docs"
+      ]
     },
     "code": {
       "description": "writing, fixing, explaining or running code and scripts",
       "model": "qwen2.5-coder:3b",
-      "fallbacks": ["qwen2.5:3b", "llama3.2:3b"],
+      "fallbacks": [
+        "qwen2.5:3b",
+        "llama3.2:3b"
+      ],
       "tools": true,
-      "options": {"temperature": 0.2},
-      "keywords": ["code", "script", "python", "javascript", "js", "html", "css", "bash script", "function", "class", "bug", "debug", "error", "traceback", "exception", "compile", "program", "app", "api", "regex", "refactor", "json", "sql", "rust", "java", "c\\+\\+", "node", "npm", "import", "syntax"]
+      "options": {
+        "temperature": 0.2
+      },
+      "keywords": [
+        "code",
+        "script",
+        "python",
+        "javascript",
+        "js",
+        "html",
+        "css",
+        "bash script",
+        "function",
+        "class",
+        "bug",
+        "debug",
+        "error",
+        "traceback",
+        "exception",
+        "compile",
+        "program",
+        "app",
+        "api",
+        "regex",
+        "refactor",
+        "json",
+        "sql",
+        "rust",
+        "java",
+        "c\\+\\+",
+        "node",
+        "npm",
+        "import",
+        "syntax",
+        "webapp",
+        "web app",
+        "website",
+        "web page",
+        "webpage",
+        "frontend",
+        "front end",
+        "button",
+        "ui"
+      ]
     },
     "shell": {
       "description": "doing things on the device: files, folders, installing, running commands",
       "model": "qwen2.5:3b",
-      "fallbacks": ["llama3.2:3b", "qwen2.5-coder:3b"],
+      "fallbacks": [
+        "llama3.2:3b",
+        "qwen2.5-coder:3b"
+      ],
       "tools": true,
-      "options": {"temperature": 0.3},
-      "keywords": ["install", "run", "file", "files", "folder", "directory", "download", "termux", "pkg", "pip", "command", "terminal", "delete", "remove", "create", "make", "move", "copy", "rename", "git", "clone", "list", "check", "update", "upgrade", "disk", "storage", "process", "zip", "unzip", "convert", "find", "search", "open", "set up", "setup", "configure", "server", "start", "stop", "kill"]
+      "options": {
+        "temperature": 0.3
+      },
+      "keywords": [
+        "install",
+        "run",
+        "file",
+        "files",
+        "folder",
+        "directory",
+        "download",
+        "termux",
+        "pkg",
+        "pip",
+        "command",
+        "terminal",
+        "delete",
+        "remove",
+        "create",
+        "make",
+        "move",
+        "copy",
+        "rename",
+        "git",
+        "clone",
+        "list",
+        "check",
+        "update",
+        "upgrade",
+        "disk",
+        "storage",
+        "process",
+        "zip",
+        "unzip",
+        "convert",
+        "find",
+        "search",
+        "open",
+        "set up",
+        "setup",
+        "configure",
+        "server",
+        "start",
+        "stop",
+        "kill"
+      ]
     },
     "chat": {
       "description": "conversation, questions, explanations, writing text, translation",
       "model": "llama3.2:3b",
-      "fallbacks": ["qwen2.5:3b"],
+      "fallbacks": [
+        "qwen2.5:3b"
+      ],
       "tools": false,
-      "options": {"temperature": 0.7},
-      "keywords": ["hi", "hello", "hey", "thanks", "thank you", "explain", "what is", "what are", "who is", "why", "how does", "tell me", "story", "poem", "joke", "translate", "summarize", "summary", "meaning", "define", "opinion", "advice", "write an email"]
+      "options": {
+        "temperature": 0.7
+      },
+      "keywords": [
+        "hi",
+        "hello",
+        "hey",
+        "thanks",
+        "thank you",
+        "explain",
+        "what is",
+        "what are",
+        "who is",
+        "why",
+        "how does",
+        "tell me",
+        "story",
+        "poem",
+        "joke",
+        "translate",
+        "summarize",
+        "summary",
+        "meaning",
+        "define",
+        "opinion",
+        "advice",
+        "write an email"
+      ]
     }
   }
 }
