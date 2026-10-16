@@ -342,16 +342,17 @@ def _ask_gemini(key, prompt):
 
 def experts():
     """Available online experts, in order of preference."""
+    # Gemini first (free tier); Claude only as a last resort, to save Claude credit.
     found = []
-    if api_key():
-        found.append(("claude", settings()["teacher_model"], api_key(), _ask_claude))
     if gemini_key():
         found.append(("gemini", settings()["gemini_model"], gemini_key(), _ask_gemini))
+    if api_key():
+        found.append(("claude", settings()["teacher_model"], api_key(), _ask_claude))
     return found
 
 
 def ask_expert(question, context=""):
-    """Ask Claude, else Gemini (online), and remember the answer for offline use."""
+    """Ask Gemini, else Claude (online), and remember the answer for offline use."""
     available = experts()
     if not available:
         return ("FAILED: no online expert is set up (add ANTHROPIC_API_KEY or GEMINI_API_KEY to "
