@@ -506,6 +506,12 @@ def learn():
     failures = review_sessions(report)
     report.append(f"- files: {index_files(verbose=False)}")
     social_digest(report)
+    try:  # refresh Alaa's writing voice for the WhatsApp stand-in (stand_in.py)
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import stand_in
+        report.append(f"- voice: {stand_in.learn_voice()}")
+    except Exception as e:  # the stand-in is optional
+        report.append(f"- voice refresh skipped: {e}")
     follow_news(report)
     teacher_review(failures, report)
     total = db().execute("SELECT kind, COUNT(*) FROM memories GROUP BY kind").fetchall()
