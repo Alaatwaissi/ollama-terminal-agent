@@ -135,6 +135,7 @@ def learn_voice():
                         found.append({"them": prev[:200], "me": text})
                 else:
                     prev = text
+    found += meta_export_replies()
     examples = (found[-MAX_EXAMPLES:] + voice["examples"])[:MAX_EXAMPLES]
     voice["examples"] = examples
     if examples:
@@ -155,6 +156,67 @@ def classify(message):
         "Label the WhatsApp message with one kind. Examples:\n" + CLASSIFY_EXAMPLES +
         f"\n\nMessage: {message}\nKind:", CLASSIFY_SCHEMA))
     return data.get("kind", "other")
+
+
+META_OWNER = {"alaa jamil twaissi", "alaajtwaissi", "alaa twaissi"}
+
+
+def _fix(text):
+    # Meta's JSON export stores UTF-8 text as latin-1 escapes; undo that so Arabic reads right.
+    try:
+        return text.encode("latin-1").decode("utf-8")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return text
+
+
+def meta_export_replies():
+    """Alaa's replies from a Facebook/Instagram "Download your information" export (JSON)
+    saved in Download (zip or unzipped). Returns [{them, me}] pairs: his message and the
+    message from the other person just before it."""
+    import zipfile
+    roots = ["/storage/emulated/0/Download", EXPORTS]
+    files = []  # (opener, name)
+    for root in roots:
+        if not os.path.isdir(root):
+            continue
+        for name in os.listdir(root):
+            path = os.path.join(root, name)
+            low = name.lower()
+            if low.endswith(".zip") and ("facebook" in low or "instagram" in low or "meta" in low):
+                try:
+                    z = zipfile.ZipFile(path)
+                except zipfile.BadZipFile:
+                    continue
+                for member in z.namelist():
+                    if re.search(r"messages/inbox/.+/message_\d+\.json$", member):
+                        files.append((lambda m=member, z=z: z.read(m), member))
+            elif os.path.isdir(path) and ("facebook" in low or "instagram" in low):
+                for dirpath, _, names in os.walk(path):
+                    for n in names:
+                        full = os.path.join(dirpath, n)
+                        if re.search(r"messages/inbox/.+/message_\d+\.json$", full):
+                            files.append((lambda f=full: open(f, "rb").read(), full))
+    pairs = []
+    for read, _ in files:
+        try:
+            convo = json.loads(read())
+        except (ValueError, OSError):
+            continue
+        if len(convo.get("participants", [])) != 2:  # one-to-one chats only
+            continue
+        msgs = sorted(convo.get("messages", []), key=lambda m: m.get("timestamp_ms", 0))
+        prev = ""
+        for m in msgs:
+            text = _fix(m.get("content", "") or "").strip()
+            mine = _fix(m.get("sender_name", "")).strip().lower() in META_OWNER
+            if not text or len(text) > 300 or text.startswith(("http", "You sent", "Reacted")):
+                continue
+            if mine and prev:
+                pairs.append({"them": prev[:200], "me": text})
+                prev = ""
+            elif not mine:
+                prev = text
+    return pairs
 
 
 def draft(sender, message):
