@@ -614,6 +614,22 @@ def main(argv):
             print(f"[{kind}] {text}  ({source})")
     elif cmd == "remember":
         print(remember(rest, "fact"))
+    elif cmd == "key" and rest in ("gemini", "claude"):
+        # Save the API key currently in the clipboard to ~/.agent_brain/env without printing it.
+        name, prefix = ("GEMINI_API_KEY", "AI") if rest == "gemini" else ("ANTHROPIC_API_KEY", "sk-")
+        key = subprocess.run(["termux-clipboard-get"], capture_output=True, text=True, timeout=20).stdout.strip()
+        if not key.startswith(prefix) or " " in key:
+            print(f"The clipboard doesn't hold a {rest} key (it should start with {prefix}). Copy it and try again.")
+            return
+        path = os.path.join(BRAIN_DIR, "env")
+        lines = open(path).read().splitlines() if os.path.exists(path) else []
+        lines = [l for l in lines if not re.match(rf"\s*(export\s+)?{name}=", l)] + [f"export {name}={key}"]
+        os.umask(0o077)
+        with open(path, "w") as f:
+            f.write("\n".join(lines) + "\n")
+        os.chmod(path, 0o600)
+        subprocess.run(["termux-clipboard-set", ""], timeout=20)
+        print(f"Saved your {rest} key (…{key[-4:]}) and cleared the clipboard.")
     elif cmd == "follow":
         s = settings()
         if rest and rest not in s["follow_topics"]:
