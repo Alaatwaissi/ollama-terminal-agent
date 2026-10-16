@@ -266,10 +266,10 @@ def index_files(verbose=True):
 
 # ---------- models ----------
 
-def ask_local(prompt, schema=None, model=None):
+def ask_local(prompt, schema=None, model=None, temperature=0.2):
     cfg = settings()
     body = {"model": model or cfg["learn_model"], "prompt": prompt, "stream": False,
-            "options": {"temperature": 0.2, "num_ctx": 8192}}
+            "options": {"temperature": temperature, "num_ctx": 8192}}
     if schema:
         body["format"] = schema
     r = requests.post(f"{cfg['ollama_url']}/api/generate", json=body, timeout=900)
