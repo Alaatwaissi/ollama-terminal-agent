@@ -277,6 +277,21 @@ def ask_local(prompt, schema=None, model=None, temperature=0.2):
     return r.json().get("response", "")
 
 
+def api_key():
+    """ANTHROPIC_API_KEY from the environment, else from ~/.agent_brain/env."""
+    key = os.environ.get("ANTHROPIC_API_KEY", "")
+    if not key:
+        try:
+            with open(os.path.join(BRAIN_DIR, "env")) as f:
+                for line in f:
+                    m = re.match(r"\s*(?:export\s+)?ANTHROPIC_API_KEY=['\"]?([^'\"\s]+)", line)
+                    if m:
+                        key = m.group(1)
+        except OSError:
+            pass
+    return key if key.startswith("sk-") else ""
+
+
 def online():
     try:
         requests.head("https://api.anthropic.com", timeout=4)
@@ -287,7 +302,7 @@ def online():
 
 def ask_expert(question, context=""):
     """Ask Claude (online, costs a little) and remember the answer for offline use."""
-    key = os.environ.get("ANTHROPIC_API_KEY")
+    key = api_key()
     if not key:
         return "FAILED: no ANTHROPIC_API_KEY set, so the online expert is off. Answer with what you know."
     if not online():
@@ -356,7 +371,7 @@ def review_sessions(report):
 
 
 def teacher_review(failures, report):
-    if not failures or not settings()["use_teacher"] or not os.environ.get("ANTHROPIC_API_KEY"):
+    if not failures or not settings()["use_teacher"] or not api_key():
         return
     text = "\n\n".join(f"TASK: {e['user']}\nTOOLS: {'; '.join(e['tools'])}\nERRORS: {' | '.join(e['failures'])}"
                        for e in failures[:10])
@@ -534,7 +549,7 @@ def status():
     return (f"Memories: {', '.join(f'{k} {n}' for k, n in mems) or 'none'}\n"
             f"Indexed: {files} files, {chunks} chunks\n"
             f"Follow topics: {', '.join(settings()['follow_topics']) or 'none'}\n"
-            f"Teacher (Claude): {'on' if os.environ.get('ANTHROPIC_API_KEY') else 'off (no ANTHROPIC_API_KEY)'}")
+            f"Teacher (Claude): {'on' if api_key() else 'off (add your key to ~/.agent_brain/env)'}")
 
 
 def main(argv):
