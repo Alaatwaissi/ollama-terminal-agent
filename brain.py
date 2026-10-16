@@ -42,6 +42,7 @@ DEFAULT_SETTINGS = {
     "learn_model": "qwen2.5:3b",
     "teacher_model": "claude-haiku-5-5",
     "use_teacher": True,
+    "gemini_model": "gemini-flash-latest",
     "index_folders": [
         f"{STORAGE}/Download/AI agent",
         f"{STORAGE}/Download/Projects",
@@ -277,50 +278,92 @@ def ask_local(prompt, schema=None, model=None, temperature=0.2):
     return r.json().get("response", "")
 
 
-def api_key():
-    """ANTHROPIC_API_KEY from the environment, else from ~/.agent_brain/env."""
-    key = os.environ.get("ANTHROPIC_API_KEY", "")
+def _env_key(name, prefix):
+    """An API key from the environment, else from ~/.agent_brain/env."""
+    key = os.environ.get(name, "")
     if not key:
         try:
             with open(os.path.join(BRAIN_DIR, "env")) as f:
                 for line in f:
-                    m = re.match(r"\s*(?:export\s+)?ANTHROPIC_API_KEY=['\"]?([^'\"\s]+)", line)
+                    m = re.match(rf"\s*(?:export\s+)?{name}=['\"]?([^'\"\s]+)", line)
                     if m:
                         key = m.group(1)
         except OSError:
             pass
-    return key if key.startswith("sk-") else ""
+    return key if key.startswith(prefix) else ""
+
+
+def api_key():
+    return _env_key("ANTHROPIC_API_KEY", "sk-")
+
+
+def gemini_key():
+    return _env_key("GEMINI_API_KEY", "AI")
 
 
 def online():
     try:
-        requests.head("https://api.anthropic.com", timeout=4)
+        requests.head("https://www.google.com", timeout=4)
         return True
     except requests.RequestException:
         return False
 
 
+EXPERT_SYSTEM = ("You are an expert helping a small local AI agent on an Android phone (Termux). "
+                 "Answer precisely and briefly; give working commands/code.")
+
+
+def _ask_claude(key, prompt):
+    r = requests.post("https://api.anthropic.com/v1/messages", timeout=120, headers={
+        "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+        json={"model": settings()["teacher_model"], "max_tokens": 1200, "system": EXPERT_SYSTEM,
+              "messages": [{"role": "user", "content": prompt}]})
+    r.raise_for_status()
+    return "".join(b.get("text", "") for b in r.json().get("content", []))
+
+
+def _ask_gemini(key, prompt):
+    model = settings()["gemini_model"]
+    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                      timeout=120, headers={"x-goog-api-key": key, "content-type": "application/json"},
+                      json={"systemInstruction": {"parts": [{"text": EXPERT_SYSTEM}]},
+                            "contents": [{"role": "user", "parts": [{"text": prompt}]}]})
+    r.raise_for_status()
+    parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+    return "".join(p.get("text", "") for p in parts)
+
+
+def experts():
+    """Available online experts, in order of preference."""
+    found = []
+    if api_key():
+        found.append(("claude", settings()["teacher_model"], api_key(), _ask_claude))
+    if gemini_key():
+        found.append(("gemini", settings()["gemini_model"], gemini_key(), _ask_gemini))
+    return found
+
+
 def ask_expert(question, context=""):
-    """Ask Claude (online, costs a little) and remember the answer for offline use."""
-    key = api_key()
-    if not key:
-        return "FAILED: no ANTHROPIC_API_KEY set, so the online expert is off. Answer with what you know."
+    """Ask Claude, else Gemini (online), and remember the answer for offline use."""
+    available = experts()
+    if not available:
+        return ("FAILED: no online expert is set up (add ANTHROPIC_API_KEY or GEMINI_API_KEY to "
+                "~/.agent_brain/env). Answer with what you know.")
     if not online():
         return "FAILED: offline right now. Answer with what you know, or try again when online."
-    cfg = settings()
-    try:
-        r = requests.post("https://api.anthropic.com/v1/messages", timeout=120, headers={
-            "x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": cfg["teacher_model"], "max_tokens": 1200,
-                  "system": "You are an expert helping a small local AI agent on an Android phone "
-                            "(Termux). Answer precisely and briefly; give working commands/code.",
-                  "messages": [{"role": "user", "content": f"{context}\n\nQuestion: {question}".strip()}]})
-        r.raise_for_status()
-        answer = "".join(b.get("text", "") for b in r.json().get("content", []))
-    except requests.RequestException as e:
-        return f"FAILED: expert call failed ({e})."
-    remember(f"Q: {question[:200]} -> A: {answer[:600]}", kind="expert", source=cfg["teacher_model"])
-    return answer
+    prompt = f"{context}\n\nQuestion: {question}".strip()
+    errors = []
+    for name, model, key, call in available:
+        try:
+            answer = call(key, prompt)
+        except (requests.RequestException, ValueError, IndexError) as e:
+            status = getattr(getattr(e, "response", None), "status_code", "")
+            errors.append(f"{name} failed {status}".strip())
+            continue
+        if answer.strip():
+            remember(f"Q: {question[:200]} -> A: {answer[:600]}", kind="expert", source=model)
+            return answer
+    return f"FAILED: {'; '.join(errors)}. Answer with what you know."
 
 
 # ---------- daily learning ----------
@@ -371,7 +414,7 @@ def review_sessions(report):
 
 
 def teacher_review(failures, report):
-    if not failures or not settings()["use_teacher"] or not api_key():
+    if not failures or not settings()["use_teacher"] or not experts():
         return
     text = "\n\n".join(f"TASK: {e['user']}\nTOOLS: {'; '.join(e['tools'])}\nERRORS: {' | '.join(e['failures'])}"
                        for e in failures[:10])
@@ -549,7 +592,7 @@ def status():
     return (f"Memories: {', '.join(f'{k} {n}' for k, n in mems) or 'none'}\n"
             f"Indexed: {files} files, {chunks} chunks\n"
             f"Follow topics: {', '.join(settings()['follow_topics']) or 'none'}\n"
-            f"Teacher (Claude): {'on' if api_key() else 'off (add your key to ~/.agent_brain/env)'}")
+            f"Online experts: {', '.join(f'{n} ({m})' for n, m, _, _ in experts()) or 'none (add keys to ~/.agent_brain/env)'}")
 
 
 def main(argv):
