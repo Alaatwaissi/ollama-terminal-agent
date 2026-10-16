@@ -42,7 +42,9 @@ DEFAULT_SETTINGS = {
     "learn_model": "qwen2.5:3b",
     "teacher_model": "claude-haiku-5-5",
     "use_teacher": True,
-    "gemini_model": "gemini-flash-latest",
+    "gemini_model": "gemini-3.5-flash",
+    # Tried in order when the main model is busy (503) or rate-limited (429).
+    "gemini_fallbacks": ["gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-flash-lite-latest"],
     "index_folders": [
         f"{STORAGE}/Download/AI agent",
         f"{STORAGE}/Download/Projects",
@@ -290,7 +292,7 @@ def _env_key(name, prefix):
                         key = m.group(1)
         except OSError:
             pass
-    return key if key.startswith(prefix) else ""
+    return key if key.startswith(prefix) and " " not in key else ""
 
 
 def api_key():
@@ -298,7 +300,7 @@ def api_key():
 
 
 def gemini_key():
-    return _env_key("GEMINI_API_KEY", "AI")
+    return _env_key("GEMINI_API_KEY", ("AI", "AQ."))
 
 
 def online():
@@ -323,14 +325,19 @@ def _ask_claude(key, prompt):
 
 
 def _ask_gemini(key, prompt):
-    model = settings()["gemini_model"]
-    r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
-                      timeout=120, headers={"x-goog-api-key": key, "content-type": "application/json"},
-                      json={"systemInstruction": {"parts": [{"text": EXPERT_SYSTEM}]},
-                            "contents": [{"role": "user", "parts": [{"text": prompt}]}]})
+    cfg = settings()
+    for model in [cfg["gemini_model"]] + cfg.get("gemini_fallbacks", []):
+        r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+                          timeout=120, headers={"x-goog-api-key": key, "content-type": "application/json"},
+                          json={"systemInstruction": {"parts": [{"text": EXPERT_SYSTEM}]},
+                                "contents": [{"role": "user", "parts": [{"text": prompt}]}]})
+        if r.status_code in (429, 503):  # busy or rate-limited: try the next model
+            continue
+        r.raise_for_status()
+        parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
+        return "".join(p.get("text", "") for p in parts)
     r.raise_for_status()
-    parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts)
+    return ""
 
 
 def experts():
@@ -616,10 +623,10 @@ def main(argv):
         print(remember(rest, "fact"))
     elif cmd == "key" and rest in ("gemini", "claude"):
         # Save the API key currently in the clipboard to ~/.agent_brain/env without printing it.
-        name, prefix = ("GEMINI_API_KEY", "AI") if rest == "gemini" else ("ANTHROPIC_API_KEY", "sk-")
+        name, prefix = ("GEMINI_API_KEY", ("AI", "AQ.")) if rest == "gemini" else ("ANTHROPIC_API_KEY", ("sk-",))
         key = subprocess.run(["termux-clipboard-get"], capture_output=True, text=True, timeout=20).stdout.strip()
         if not key.startswith(prefix) or " " in key:
-            print(f"The clipboard doesn't hold a {rest} key (it should start with {prefix}). Copy it and try again.")
+            print(f"The clipboard doesn't hold a {rest} key (it should start with {' or '.join(prefix)}). Copy it and try again.")
             return
         path = os.path.join(BRAIN_DIR, "env")
         lines = open(path).read().splitlines() if os.path.exists(path) else []
