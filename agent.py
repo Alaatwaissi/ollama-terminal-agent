@@ -10,6 +10,15 @@ from urllib.parse import parse_qs, quote, unquote, urlparse
 
 import requests
 
+try:  # long-term memory and daily learning (brain.py); the agent works without it
+    import brain
+except ImportError:
+    brain = None
+try:  # Buddy screen control + Termux:API (phone_bridge.py)
+    from phone_bridge import Phone, RISKY_TOOLS
+except ImportError:
+    Phone = None
+
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36")
 
@@ -112,7 +121,79 @@ The device is Android running Termux:
 - Read each command's output. If it failed, read the error, fix the cause
   (install what is missing, correct the command or code) and try again until it works.
 - Run one command at a time. When the task is done, answer the user in plain text.
+- Before a task about the user's projects or files, use memory_search to find what you
+  already know. When the user tells you a lasting fact or preference, save it with remember.
+- To use the phone's apps (WhatsApp, Settings, TradingView...), use the phone tool:
+  first {"action": "read_screen"}, then tap/type_text/open_app with ids from that read.
+  Before sending, posting, buying or deleting anything, ask the user first.
+- If you are stuck or unsure after trying, use ask_expert (a stronger online AI).
 """
+
+BRAIN_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "memory_search",
+            "description": "Search what you learned before and the user's files (projects, PDFs, notes). Works offline.",
+            "parameters": {
+                "type": "object",
+                "properties": {"query": {"type": "string", "description": "Words to look for."}},
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "remember",
+            "description": "Save a lasting fact, preference or lesson so you know it in future chats.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "One sentence to remember."},
+                    "kind": {"type": "string", "enum": ["fact", "preference", "lesson"]},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_expert",
+            "description": "Ask a stronger online AI (Claude) when you are stuck. Needs internet; costs a little.",
+            "parameters": {
+                "type": "object",
+                "properties": {"question": {"type": "string", "description": "The full question with details."}},
+                "required": ["question"],
+            },
+        },
+    },
+]
+
+PHONE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "phone",
+        "description": "Use the phone screen through the Buddy app. Actions: read_screen, tap "
+                       "(element), type_text (text), scroll (direction), press (button: back/home), "
+                       "open_app (app), open_url (url), list_apps, wait (ms), battery, notifications.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "description": "e.g. read_screen, tap, open_app"},
+                "element": {"type": "integer", "description": "Element id from read_screen (for tap)."},
+                "text": {"type": "string", "description": "Text to type (type_text)."},
+                "app": {"type": "string", "description": "App name (open_app)."},
+                "url": {"type": "string"},
+                "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                "button": {"type": "string", "enum": ["back", "home", "recents", "notifications"]},
+                "ms": {"type": "integer"},
+            },
+            "required": ["action"],
+        },
+    },
+}
 
 TOOLS = [
     {
@@ -206,6 +287,10 @@ TOOLS = [
         },
     },
 ]
+if brain:
+    TOOLS += BRAIN_TOOLS
+if Phone:
+    TOOLS.append(PHONE_TOOL)
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
 
 # Commands that /auto safe may run without asking: installs and read-only checks,
@@ -243,6 +328,11 @@ HELP = """Commands:
   /save                 save current settings to agent_config.json
   /reload               reload settings from agent_config.json
   /clear                forget the conversation
+  /brain                what the agent has learned and indexed
+  /learn                learn now (normally runs every night)
+  /follow <topic>       read news on a topic daily when online
+  /remember <text>      save a fact for future chats
+  /recall <words>       search memory and your files
   /exit                 quit
 """
 
@@ -661,6 +751,30 @@ def read_file(config, path):
     return f"{full}:\n{numbered}" if numbered else f"{full} is empty."
 
 
+_phone = None
+
+
+def run_phone(config, args):
+    global _phone
+    _phone = _phone or Phone()
+    action = str(args.get("action") or args.get("tool") or "").strip()
+    if action == "battery":
+        return _phone.battery()
+    if action == "notifications":
+        return _phone.notifications()[:config["max_output_chars"]]
+    allowed = {"read_screen", "tap", "long_press", "type_text", "scroll", "swipe", "press",
+               "open_app", "open_url", "list_apps", "wait", "screenshot"}
+    if action not in allowed | RISKY_TOOLS:
+        return f"Bad tool call. phone action must be one of: {', '.join(sorted(allowed))}, battery, notifications."
+    params = {k: v for k, v in args.items() if k not in ("action", "tool") and v not in (None, "")}
+    if action in RISKY_TOOLS and not approve(config, f"phone {action} {params}", False):
+        return "The user declined this phone action."
+    print(f"\n[phone] {action} {params or ''}")
+    result = _phone.call(action, **params)
+    limit = config["max_output_chars"]
+    return result if len(result) <= limit else result[:limit] + "\n...[screen truncated]..."
+
+
 def run_tool(config, name, args, failed):
     if not isinstance(args, dict):
         args = {}
@@ -703,6 +817,30 @@ def run_tool(config, name, args, failed):
         if not isinstance(path, str) or not path.strip():
             path = "./"
         return download_file(config, url.strip(), path)
+    if name == "memory_search" and brain:
+        query = args.get("query") or args.get("q") or args.get("text")
+        if not isinstance(query, str) or not query.strip():
+            return 'Bad tool call. memory_search needs {"query": "..."}.'
+        print(f"\n[memory] {query}")
+        found = [f"[{k}] {t}" for k, t in brain.recall(query)] + \
+                [f"{p}: {s}" for p, s in brain.search_files(query, 6)]
+        return "\n".join(found) if found else "Nothing found in memory or files. Try other words."
+    if name == "remember" and brain:
+        text = args.get("text") or args.get("fact") or args.get("content")
+        if not isinstance(text, str) or not text.strip():
+            return 'Bad tool call. remember needs {"text": "..."}.'
+        kind = args.get("kind") if args.get("kind") in ("fact", "preference", "lesson") else "fact"
+        result = brain.remember(text, kind, source="chat")
+        print(f"\n[{result}]")
+        return result
+    if name == "ask_expert" and brain:
+        question = args.get("question") or args.get("query") or args.get("text")
+        if not isinstance(question, str) or not question.strip():
+            return 'Bad tool call. ask_expert needs {"question": "..."}.'
+        print(f"\n[asking expert] {question[:80]}")
+        return brain.ask_expert(question)
+    if name == "phone" and Phone:
+        return run_phone(config, args)
     return f"Unknown tool {name!r}. Available tools: {', '.join(sorted(TOOL_NAMES))}."
 
 
@@ -775,6 +913,13 @@ def chat(config, history, user_input):
                    " create new projects as subfolders of it."
                    " Files there cannot be executed directly (./script fails);"
                    " run them with an interpreter, e.g. `bash run.sh` or `python main.py`.")
+    if brain:
+        try:
+            memory = brain.context_for(user_input)
+        except Exception:  # memory must never break a chat
+            memory = ""
+        if memory:
+            system += "\n\n" + memory
 
     turn = [{"role": "user", "content": user_input}]
     past = history[-config["max_history"]:] if config["keep_history"] else []
@@ -812,6 +957,11 @@ def chat(config, history, user_input):
             print(f"\n[Stopped after {config['max_steps']} steps. Raise max_steps in the config if needed.]\n")
     finally:
         history.extend(turn)
+        if brain:
+            try:
+                brain.log_turn(user_input, turn, model, route_name if config["routing"] else "fixed")
+            except Exception:
+                pass
 
 
 def on_off(arg):
@@ -883,6 +1033,19 @@ def handle_command(line, config, history):
     elif cmd == "clear":
         history.clear()
         print("Conversation cleared.")
+    elif cmd in ("brain", "learn", "follow", "remember", "recall") and not brain:
+        print("brain.py isn't available next to agent.py.")
+    elif cmd == "brain":
+        print(brain.status())
+    elif cmd == "learn":
+        print("Learning from recent sessions, files and news (this can take a few minutes)...")
+        print(brain.learn())
+    elif cmd == "follow":
+        brain.main(["follow", arg] if arg else ["follow"])
+    elif cmd == "remember" and arg:
+        print(brain.remember(arg, "fact"))
+    elif cmd == "recall" and arg:
+        brain.main(["search", arg])
     else:
         print("Unknown command. Type /help.")
 
