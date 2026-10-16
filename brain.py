@@ -622,6 +622,21 @@ def main(argv):
             print(f"[{kind}] {text}  ({source})")
     elif cmd == "remember":
         print(remember(rest, "fact"))
+    elif cmd == "local" and rest:
+        # Offload bulk work (summaries, extraction, drafts) to the local model to save credit.
+        # Usage: brain.py local "<instruction>" [file]   (the file's text is appended, PDFs too)
+        args = argv[1:]
+        instruction, path = args[0], (args[1] if len(args) > 1 else "")
+        text = ""
+        if path:
+            text = _extract(os.path.expanduser(path), settings())[:24000]
+            if not text.strip():
+                print(f"Couldn't read text from {path}.")
+                return
+        try:
+            print(ask_local(f"{instruction}\n\n{text}".strip()).strip())
+        except requests.RequestException as e:
+            print(f"Local model unavailable ({e}). Is Ollama running? (ollama serve)")
     elif cmd == "key" and rest in ("gemini", "claude"):
         # Save the API key currently in the clipboard to ~/.agent_brain/env without printing it.
         name, prefix = ("GEMINI_API_KEY", ("AI", "AQ.")) if rest == "gemini" else ("ANTHROPIC_API_KEY", ("sk-",))
