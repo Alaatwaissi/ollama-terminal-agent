@@ -326,6 +326,7 @@ def _ask_claude(key, prompt):
 
 def _ask_gemini(key, prompt):
     cfg = settings()
+    r = None
     for model in [cfg["gemini_model"]] + cfg.get("gemini_fallbacks", []):
         r = requests.post(f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
                           timeout=120, headers={"x-goog-api-key": key, "content-type": "application/json"},
@@ -336,7 +337,8 @@ def _ask_gemini(key, prompt):
         r.raise_for_status()
         parts = (r.json().get("candidates") or [{}])[0].get("content", {}).get("parts", [])
         return "".join(p.get("text", "") for p in parts)
-    r.raise_for_status()
+    if r is not None:
+        r.raise_for_status()
     return ""
 
 

@@ -98,13 +98,13 @@ class Phone:
 
     def tools(self):
         self._connect()
-        return [t["name"] for t in self._rpc("tools/list").get("result", {}).get("tools", [])]
+        return [t["name"] for t in (self._rpc("tools/list") or {}).get("result", {}).get("tools", [])]
 
     def call(self, tool, **args):
         """Run a Buddy tool and return its text output (or an error string)."""
         try:
             self._connect()
-            data = self._rpc("tools/call", {"name": tool, "arguments": args})
+            data = self._rpc("tools/call", {"name": tool, "arguments": args}) or {}
         except (requests.RequestException, ValueError) as e:
             return f"FAILED: Buddy isn't reachable ({e}). Is the Buddy app running?"
         if "error" in data:

@@ -1,18 +1,15 @@
 {
   "ollama_url": "http://127.0.0.1:11434",
-  "model": "llama3.2:3b",
-  "system": "You are a helpful technical assistant running locally. Be concise and give working code when asked.",
+  "model": "qwen2.5:3b",
+  "system": "You are a helpful technical assistant running locally on an Android phone. Be concise and give working code when asked.",
   "stream": true,
   "keep_history": true,
   "max_history": 20,
   "tools_enabled": true,
-  "auto_approve": "safe",
+  "auto_approve": "all",
   "command_timeout": 300,
   "max_output_chars": 4000,
   "max_steps": 25,
-  "routing": true,
-  "default_route": "shell",
-  "router_model": null,
   "max_retries": 2,
   "options": {
     "top_p": 0.95,
@@ -21,12 +18,19 @@
     "num_ctx": 8192,
     "num_predict": -1
   },
+  "backend": "freellmapi",
+  "freellmapi_url": "http://localhost:3001",
+  "freellmapi_key": "",
+  "routing": true,
+  "default_route": "shell",
+  "router_model": null,
   "routes": {
     "web": {
       "description": "looking things up online: searching, news, prices, docs, websites",
-      "model": "qwen2.5:3b",
+      "model": "auto",
       "fallbacks": [
-        "llama3.2:3b",
+        "qwen2.5:3b",
+        "alaa-minimax",
         "qwen2.5-coder:3b"
       ],
       "tools": true,
@@ -58,10 +62,11 @@
     },
     "code": {
       "description": "writing, fixing, explaining or running code and scripts",
-      "model": "qwen2.5-coder:3b",
+      "model": "auto:smart",
       "fallbacks": [
         "qwen2.5:3b",
-        "llama3.2:3b"
+        "alaa-minimax",
+        "qwen2.5-coder:3b"
       ],
       "tools": true,
       "options": {
@@ -111,9 +116,10 @@
     },
     "shell": {
       "description": "doing things on the device: files, folders, installing, running commands",
-      "model": "qwen2.5:3b",
+      "model": "auto",
       "fallbacks": [
-        "llama3.2:3b",
+        "qwen2.5:3b",
+        "alaa-minimax",
         "qwen2.5-coder:3b"
       ],
       "tools": true,
@@ -166,11 +172,13 @@
     },
     "chat": {
       "description": "conversation, questions, explanations, writing text, translation",
-      "model": "llama3.2:3b",
+      "model": "auto:fast",
       "fallbacks": [
-        "qwen2.5:3b"
+        "qwen2.5:3b",
+        "alaa-minimax",
+        "qwen2.5-coder:3b"
       ],
-      "tools": false,
+      "tools": true,
       "options": {
         "temperature": 0.7
       },
@@ -200,5 +208,6 @@
         "write an email"
       ]
     }
-  }
+  },
+  "workspace": "/storage/emulated/0/Download/AI agent"
 }

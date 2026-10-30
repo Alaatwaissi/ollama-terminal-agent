@@ -1,5 +1,7 @@
+import base64
 import html
 import json
+import mimetypes
 import os
 import re
 import subprocess
@@ -18,6 +20,7 @@ try:  # Buddy screen control + Termux:API (phone_bridge.py)
     from phone_bridge import Phone, RISKY_TOOLS
 except ImportError:
     Phone = None
+    RISKY_TOOLS = frozenset()
 
 USER_AGENT = ("Mozilla/5.0 (Linux; Android 15) AppleWebKit/537.36 "
               "(KHTML, like Gecko) Chrome/130.0 Mobile Safari/537.36")
@@ -38,6 +41,12 @@ DEFAULT_CONFIG = {
     "max_steps": 10,
     "max_retries": 2,
     "options": {},
+    # FreeLLMAPI gateway (OpenAI-compatible, many free cloud models behind one key).
+    # Its models are named auto, auto:smart, auto:fast, fusion or freellmapi/<id>;
+    # "backend": "ollama" ignores them and uses only local models.
+    "backend": "freellmapi",
+    "freellmapi_url": "http://localhost:3001",
+    "freellmapi_key": "",
     # Model routing: each message is matched to a route by keywords, and the
     # route's model (or the first installed fallback) handles it.
     "routing": True,
@@ -127,7 +136,88 @@ The device is Android running Termux:
   first {"action": "read_screen"}, then tap/type_text/open_app with ids from that read.
   Before sending, posting, buying or deleting anything, ask the user first.
 - If you are stuck or unsure after trying, use ask_expert (a stronger online AI).
+- To make media use generate_image, generate_video or text_to_speech; they save the file
+  and return its path. To understand a picture use describe_image; to turn a voice
+  recording into text use transcribe_audio.
 """
+
+GATEWAY_TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Create a picture from a text description and save it as a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "What the picture should show."},
+                    "path": {"type": "string", "description": "Where to save it, e.g. \"my_app/logo.png\". Optional."},
+                    "size": {"type": "string", "description": "e.g. \"1024x1024\". Optional."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_video",
+            "description": "Create a short video (MP4) from a text description. Takes minutes.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {"type": "string", "description": "What the video should show."},
+                    "path": {"type": "string", "description": "Where to save it, e.g. \"clips/lake.mp4\". Optional."},
+                    "duration": {"type": "integer", "description": "Seconds, e.g. 5. Optional."},
+                },
+                "required": ["prompt"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "text_to_speech",
+            "description": "Turn text into spoken audio and save it as a file.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The words to speak."},
+                    "path": {"type": "string", "description": "Where to save it, e.g. \"audio/hello.mp3\". Optional."},
+                    "voice": {"type": "string", "description": "Voice name, e.g. \"alloy\". Optional."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "transcribe_audio",
+            "description": "Turn an audio file (voice note, mp3, wav, m4a, ogg) into text.",
+            "parameters": {
+                "type": "object",
+                "properties": {"path": {"type": "string", "description": "The audio file's path."}},
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "describe_image",
+            "description": "Look at an image file or image URL and answer a question about it.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Image file path or http(s) URL."},
+                    "question": {"type": "string", "description": "What to find out. Optional."},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+]
 
 BRAIN_TOOLS = [
     {
@@ -291,7 +381,9 @@ if brain:
     TOOLS += BRAIN_TOOLS
 if Phone:
     TOOLS.append(PHONE_TOOL)
+TOOLS += GATEWAY_TOOLS
 TOOL_NAMES = {t["function"]["name"] for t in TOOLS}
+GATEWAY_NAMES = {t["function"]["name"] for t in GATEWAY_TOOLS}
 
 # Commands that /auto safe may run without asking: installs and read-only checks,
 # with no chaining, pipes or redirects.
@@ -317,6 +409,7 @@ HELP = """Commands:
   /model <name>         use one model for everything (turns routing off)
   /route auto|off|<name> auto-pick model per task, or force a route (web, code, shell, chat)
   /routes               show routes and the model each would use
+  /backend freellmapi|ollama  use FreeLLMAPI cloud models (local ones as fallback) or only local
   /system <text>        set the system prompt
   /set <option> <value> set a model option (temperature, top_p, num_ctx, ...)
   /unset <option>       remove a model option
@@ -333,6 +426,8 @@ HELP = """Commands:
   /follow <topic>       read news on a topic daily when online
   /remember <text>      save a fact for future chats
   /recall <words>       search memory and your files
+  /messages             show messages the phone receptionist took
+  /messages <request>   ask the AI about them, e.g. /messages who should I call back first?
   /exit                 quit
 """
 
@@ -362,10 +457,68 @@ def parse_value(text):
         return text
 
 
+class GatewayError(RuntimeError):
+    def __init__(self, status, message):
+        super().__init__(f"FreeLLMAPI {status}: {message}")
+        self.status = status
+
+
+def is_gateway(model):
+    return bool(model) and (model == "fusion" or model.split(":")[0] == "auto"
+                            or model.startswith("freellmapi/"))
+
+
+def gateway_on(config):
+    return config.get("backend") == "freellmapi" and bool(config.get("freellmapi_url"))
+
+
+FREELLMAPI_KEY_PATH = os.path.expanduser("~/.config/freellmapi/key")
+
+
+def gateway(config, method, path, **kwargs):
+    # The key lives outside agent_config.json so the config can be shared without it.
+    key = config.get("freellmapi_key") or os.environ.get("FREELLMAPI_KEY", "")
+    if not key and os.path.exists(FREELLMAPI_KEY_PATH):
+        with open(FREELLMAPI_KEY_PATH) as f:
+            key = f.read().strip()
+    headers = {"Authorization": f"Bearer {key}", **kwargs.pop("headers", {})}
+    url = config["freellmapi_url"].rstrip("/") + "/v1" + path
+    r = requests.request(method, url, headers=headers, timeout=kwargs.pop("timeout", 600), **kwargs)
+    if r.status_code >= 400:
+        try:
+            message = r.json()["error"]["message"]
+        except (ValueError, KeyError, TypeError):
+            message = r.text[:300]
+        r.close()
+        raise GatewayError(r.status_code, message)
+    return r
+
+
+def gateway_models(config):
+    r = gateway(config, "GET", "/models?available=true", timeout=10)
+    ids = [m["id"] for m in r.json().get("data", []) if m.get("available")]
+    models = ["freellmapi/" + i for i in ids if i not in ("auto", "fusion")]
+    if not models:  # "auto" is always listed, but can't answer without provider keys
+        return []
+    return ["auto", "auto:smart", "auto:fast", "auto:reliable"] + \
+        (["fusion"] if "fusion" in ids else []) + models
+
+
 def list_models(config):
-    r = requests.get(f"{config['ollama_url']}/api/tags", timeout=10)
-    r.raise_for_status()
-    return [m["name"] for m in r.json().get("models", [])]
+    models = []
+    if gateway_on(config):
+        try:
+            models += gateway_models(config)
+        except (requests.RequestException, RuntimeError, ValueError) as e:
+            print(f"[FreeLLMAPI unavailable: {e}]")
+    try:
+        r = requests.get(f"{config['ollama_url']}/api/tags", timeout=10)
+        r.raise_for_status()
+        models += [m["name"] for m in r.json().get("models", [])]
+    except requests.RequestException:
+        if not models:
+            raise
+    return models
 
 
 def ensure_ollama(config):
@@ -393,18 +546,32 @@ def ensure_ollama(config):
     return False
 
 
-_capabilities = {}
+_model_info = {}
 
 
-def model_capabilities(config, model):
-    if model not in _capabilities:
+def model_info(config, model):
+    if is_gateway(model):
+        return {}
+    if model not in _model_info:
         try:
             r = requests.post(f"{config['ollama_url']}/api/show", json={"model": model}, timeout=30)
             r.raise_for_status()
-            _capabilities[model] = set(r.json().get("capabilities") or ["completion"])
+            _model_info[model] = r.json()
         except requests.RequestException:
-            _capabilities[model] = set()
-    return _capabilities[model]
+            _model_info[model] = {}
+    return _model_info[model]
+
+
+def model_capabilities(config, model):
+    if is_gateway(model):  # the gateway routes tool and image requests to models that can do them
+        return {"completion", "tools", "vision"}
+    info = model_info(config, model)
+    if not info:
+        return set()
+    # Custom models built FROM a cloud model (e.g. alaa-minimax) report no capabilities.
+    if not info.get("capabilities") and info.get("remote_model"):
+        return {"completion", "tools"}
+    return set(info.get("capabilities") or ["completion"])
 
 
 def same_model(a, b):
@@ -525,12 +692,115 @@ def run_command(config, command):
     return f"{status}\n{output}" if output else status
 
 
+def to_openai_messages(messages):
+    # History is kept in Ollama's shape; OpenAI-style APIs need tool call ids,
+    # string arguments, and every tool result paired with its call.
+    out, pending = [], []
+    for i, m in enumerate(messages):
+        if m["role"] == "tool":
+            if not pending:  # its call was cut off by max_history
+                continue
+            call_id = pending.pop(0)
+            out.append({"role": "tool", "tool_call_id": m.get("tool_call_id") or call_id,
+                        "content": m.get("content") or ""})
+            continue
+        out += [{"role": "tool", "tool_call_id": p, "content": "(no result)"} for p in pending]
+        pending = []
+        if m["role"] == "assistant" and m.get("tool_calls"):
+            calls = []
+            for j, call in enumerate(m["tool_calls"]):
+                fn = call.get("function", {})
+                args = fn.get("arguments") or {}
+                calls.append({"id": call.get("id") or f"call_{i}_{j}", "type": "function",
+                              "function": {"name": fn.get("name", ""),
+                                           "arguments": args if isinstance(args, str) else json.dumps(args)}})
+            pending = [c["id"] for c in calls]
+            out.append({"role": "assistant", "content": m.get("content") or "", "tool_calls": calls})
+        else:
+            out.append({"role": m["role"], "content": m.get("content") or ""})
+    out += [{"role": "tool", "tool_call_id": p, "content": "(no result)"} for p in pending]
+    return out
+
+
+def call_gateway(config, messages, model, options, use_tools):
+    payload = {
+        "model": model[len("freellmapi/"):] if model.startswith("freellmapi/") else model,
+        "messages": to_openai_messages(messages),
+        "stream": config["stream"],
+    }
+    for key in ("temperature", "top_p"):
+        if key in options:
+            payload[key] = options[key]
+    if options.get("num_predict", -1) > 0:
+        payload["max_tokens"] = options["num_predict"]
+    if use_tools:
+        payload["tools"] = TOOLS
+
+    content, calls, printed = "", {}, False
+
+    def show(piece):
+        nonlocal printed
+        if not printed:
+            print("\nAI: ", end="", flush=True)
+            printed = True
+        print(piece, end="", flush=True)
+
+    with gateway(config, "POST", "/chat/completions", json=payload, stream=config["stream"]) as r:
+        routed = unquote(r.headers.get("X-Routed-Via", ""))
+        if routed:
+            print(f"[via {routed}]")
+        if config["stream"]:
+            for line in r.iter_lines(decode_unicode=True):
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                chunk = json.loads(data)
+                if chunk.get("error"):
+                    raise RuntimeError(chunk["error"].get("message", chunk["error"]))
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if delta.get("content"):
+                        show(delta["content"])
+                        content += delta["content"]
+                    for tc in delta.get("tool_calls") or []:
+                        slot = calls.setdefault(tc.get("index", len(calls)),
+                                                {"id": None, "name": "", "arguments": ""})
+                        fn = tc.get("function") or {}
+                        slot["id"] = tc.get("id") or slot["id"]
+                        slot["name"] += fn.get("name") or ""
+                        slot["arguments"] += fn.get("arguments") or ""
+        else:
+            message = ((r.json().get("choices") or [{}])[0]).get("message") or {}
+            content = message.get("content") or ""
+            if content:
+                show(content)
+            for n, tc in enumerate(message.get("tool_calls") or []):
+                fn = tc.get("function") or {}
+                calls[n] = {"id": tc.get("id"), "name": fn.get("name", ""),
+                            "arguments": fn.get("arguments") or ""}
+    if printed:
+        print("\n")
+
+    reply = {"role": "assistant", "content": content}
+    if calls:
+        reply["tool_calls"] = [
+            {"id": c["id"] or f"call_{n}",
+             "function": {"name": c["name"], "arguments": parse_value(c["arguments"]) if c["arguments"] else {}}}
+            for n, c in sorted(calls.items())]
+    return reply
+
+
 def call_model(config, messages, model, options, use_tools):
+    if is_gateway(model):
+        return call_gateway(config, messages, model, options, use_tools)
     payload = {
         "model": model,
         "messages": messages,
         "stream": config["stream"],
-        "options": options,
+        # Cloud models reject num_predict -1; omitting it means the same (no limit).
+        "options": {k: v for k, v in options.items() if not (k == "num_predict" and v < 0)},
     }
     if use_tools:
         payload["tools"] = TOOLS
@@ -631,8 +901,29 @@ def html_to_text(page):
     return parser.text()
 
 
+def gateway_search(config, query):
+    # FreeLLMAPI's search (Tavily, Exa, ...); None when it has no search keys.
+    if not config.get("freellmapi_url"):
+        return None
+    try:
+        data = gateway(config, "POST", "/search", timeout=60,
+                       json={"query": query, "max_results": 8, "include_answer": True}).json()
+    except (requests.RequestException, RuntimeError, ValueError):
+        return None
+    results = [f"{i}. {hit.get('title', '')}\n   {hit.get('url', '')}\n   {(hit.get('content') or '')[:300]}"
+               for i, hit in enumerate(data.get("results") or [], 1)]
+    if not results:
+        return None
+    print(f"[{len(results)} results via {data.get('provider', 'FreeLLMAPI')}]")
+    answer = f"Answer: {data['answer']}\n\n" if data.get("answer") else ""
+    return answer + "\n".join(results) + "\n\nUse fetch_url on a result to read the page."
+
+
 def web_search(config, query):
     print(f"\n[searching] {query}")
+    found = gateway_search(config, query)
+    if found:
+        return found
     try:
         r = requests.post("https://html.duckduckgo.com/html/", data={"q": query},
                           headers={"User-Agent": USER_AGENT}, timeout=20)
@@ -751,11 +1042,149 @@ def read_file(config, path):
     return f"{full}:\n{numbered}" if numbered else f"{full} is empty."
 
 
+AUDIO_EXT = {"audio/mpeg": ".mp3", "audio/mp3": ".mp3", "audio/wav": ".wav", "audio/x-wav": ".wav",
+             "audio/ogg": ".ogg", "audio/opus": ".opus", "audio/aac": ".aac", "audio/flac": ".flac"}
+
+
+def media_path(config, path, kind, ext):
+    # No path, or a folder: name the file after its kind and the time.
+    if not isinstance(path, str) or not path.strip():
+        path = "media/"
+    path = path.strip()
+    if path.endswith("/"):
+        path += f"{kind}_{time.strftime('%Y%m%d_%H%M%S')}{ext}"
+    elif not os.path.splitext(path)[1]:
+        path += ext
+    return resolve_path(config, path)
+
+
+def save_media(config, full, data):
+    os.makedirs(os.path.dirname(full), exist_ok=True)
+    with open(full, "wb") as f:
+        f.write(data)
+    print(f"[saved {len(data):,} bytes to {full}]")
+
+
+def generate_image(config, prompt, path, size):
+    if not approve(config, f"generate image: {prompt[:80]}", False):
+        return "The user declined to generate this image."
+    print("[generating image...]")
+    body = {"model": "auto", "prompt": prompt}
+    if isinstance(size, str) and size.strip():
+        body["size"] = size.strip()
+    try:
+        data = gateway(config, "POST", "/images/generations", json=body, timeout=300).json()
+        item = (data.get("data") or [{}])[0]
+        url = item.get("url") or ""
+        if item.get("b64_json"):
+            image = base64.b64decode(item["b64_json"])
+        elif url.startswith("data:"):
+            image = base64.b64decode(url.split(",", 1)[1])
+        elif url:
+            r = requests.get(url, headers={"User-Agent": USER_AGENT}, timeout=120)
+            r.raise_for_status()
+            image = r.content
+        else:
+            return "FAILED: the image service returned no image. Try again or change the prompt."
+        full = media_path(config, path, "image", ".jpg" if image[:2] == b"\xff\xd8" else ".png")
+        save_media(config, full, image)
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as e:
+        print(f"[FAILED: {e}]")
+        return f"FAILED to generate the image: {e}"
+    return f"Saved the image to {full} (made by {data.get('provider', '?')}/{data.get('model', '?')})."
+
+
+def generate_video(config, prompt, path, duration):
+    if not approve(config, f"generate video: {prompt[:80]}", False):
+        return "The user declined to generate this video."
+    print("[generating video, this can take a few minutes...]")
+    body = {"model": "auto", "prompt": prompt}
+    if isinstance(duration, int) and duration > 0:
+        body["duration"] = duration
+    try:
+        r = gateway(config, "POST", "/videos/generations", json=body, timeout=330)
+        full = media_path(config, path, "video", ".mp4")
+        save_media(config, full, r.content)
+    except (requests.RequestException, RuntimeError, OSError) as e:
+        print(f"[FAILED: {e}]")
+        return f"FAILED to generate the video: {e}"
+    return f"Saved the video to {full} (made by {r.headers.get('X-Provider', '?')})."
+
+
+def text_to_speech(config, text, path, voice):
+    if not approve(config, f"speak: {text[:80]}", False):
+        return "The user declined to create this audio."
+    print("[creating speech...]")
+    body = {"model": "auto", "input": text}
+    if isinstance(voice, str) and voice.strip():
+        body["voice"] = voice.strip()
+    try:
+        r = gateway(config, "POST", "/audio/speech", json=body, timeout=180)
+        kind = r.headers.get("Content-Type", "").split(";")[0].strip()
+        full = media_path(config, path, "speech", AUDIO_EXT.get(kind, ".mp3"))
+        save_media(config, full, r.content)
+    except (requests.RequestException, RuntimeError, OSError) as e:
+        print(f"[FAILED: {e}]")
+        return f"FAILED to create the audio: {e}"
+    return f"Saved the audio to {full}. Play it with: termux-media-player play \"{full}\""
+
+
+def transcribe_audio(config, path):
+    full = resolve_path(config, path)
+    if not approve(config, f"transcribe {full}", True):
+        return "The user declined to transcribe this file."
+    print(f"\n[transcribing] {full}")
+    try:
+        with open(full, "rb") as f:
+            r = gateway(config, "POST", "/audio/transcriptions", timeout=300,
+                        files={"file": (os.path.basename(full), f)}, data={"model": "auto"})
+        text = r.json().get("text", "")
+    except (requests.RequestException, RuntimeError, ValueError, OSError) as e:
+        print(f"[FAILED: {e}]")
+        return f"FAILED to transcribe {full}: {e}"
+    print(f"[{len(text)} chars]")
+    return f"Transcript of {full}:\n{text}" if text.strip() else f"No speech found in {full}."
+
+
+def describe_image(config, path, question):
+    # Send the bytes, not the URL: providers that can't fetch a URL answer blind.
+    try:
+        if path.startswith(("http://", "https://")):
+            r = requests.get(path, headers={"User-Agent": USER_AGENT}, timeout=60)
+            r.raise_for_status()
+            image = r.content
+            kind = r.headers.get("Content-Type", "").split(";")[0] or mimetypes.guess_type(path)[0]
+        else:
+            full = resolve_path(config, path)
+            with open(full, "rb") as f:
+                image = f.read()
+            kind = mimetypes.guess_type(full)[0]
+    except (requests.RequestException, OSError) as e:
+        return f"FAILED to get the image {path}: {e}"
+    if not (kind or "").startswith("image/"):
+        kind = "image/png"
+    image_url = f"data:{kind};base64,{base64.b64encode(image).decode()}"
+    print(f"\n[looking at] {path}")
+    body = {"model": "auto", "stream": False, "messages": [{"role": "user", "content": [
+        {"type": "text", "text": question or "Describe this image in detail."},
+        {"type": "image_url", "image_url": {"url": image_url}},
+    ]}]}
+    try:
+        data = gateway(config, "POST", "/chat/completions", json=body, timeout=180).json()
+        answer = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
+    except (requests.RequestException, RuntimeError, ValueError) as e:
+        print(f"[FAILED: {e}]")
+        return f"FAILED to look at the image: {e}"
+    return answer or "The vision model gave no answer."
+
+
 _phone = None
 
 
 def run_phone(config, args):
     global _phone
+    if Phone is None:
+        return "phone_bridge.py isn't available next to agent.py."
     _phone = _phone or Phone()
     action = str(args.get("action") or args.get("tool") or "").strip()
     if action == "battery":
@@ -807,13 +1236,12 @@ def run_tool(config, name, args, failed):
         if not isinstance(query, str) or not query.strip():
             return 'Bad tool call. web_search needs {"query": "..."}.'
         return web_search(config, query.strip())
-    url = args.get("url") or args.get("link")
-    if name in ("fetch_url", "download_file") and \
-            (not isinstance(url, str) or not url.strip().startswith(("http://", "https://"))):
-        return f'Bad tool call. {name} needs a full "url" starting with http:// or https://.'
-    if name == "fetch_url":
-        return fetch_url(config, url.strip())
-    if name == "download_file":
+    if name in ("fetch_url", "download_file"):
+        url = args.get("url") or args.get("link")
+        if not isinstance(url, str) or not url.strip().startswith(("http://", "https://")):
+            return f'Bad tool call. {name} needs a full "url" starting with http:// or https://.'
+        if name == "fetch_url":
+            return fetch_url(config, url.strip())
         if not isinstance(path, str) or not path.strip():
             path = "./"
         return download_file(config, url.strip(), path)
@@ -829,7 +1257,9 @@ def run_tool(config, name, args, failed):
         text = args.get("text") or args.get("fact") or args.get("content")
         if not isinstance(text, str) or not text.strip():
             return 'Bad tool call. remember needs {"text": "..."}.'
-        kind = args.get("kind") if args.get("kind") in ("fact", "preference", "lesson") else "fact"
+        kind = args.get("kind")
+        if kind not in ("fact", "preference", "lesson"):
+            kind = "fact"
         result = brain.remember(text, kind, source="chat")
         print(f"\n[{result}]")
         return result
@@ -841,6 +1271,29 @@ def run_tool(config, name, args, failed):
         return brain.ask_expert(question)
     if name == "phone" and Phone:
         return run_phone(config, args)
+    if name in GATEWAY_NAMES:
+        if not config.get("freellmapi_url"):
+            return f"{name} needs FreeLLMAPI: set freellmapi_url and freellmapi_key in agent_config.json."
+        text = args.get("prompt") or args.get("text") or args.get("description") or args.get("input")
+        if name in ("transcribe_audio", "describe_image"):
+            source = path or args.get("url") or args.get("image")
+            if not isinstance(source, str) or not source.strip():
+                return f'Bad tool call. {name} needs {{"path": "..."}}.'
+            if name == "transcribe_audio":
+                return transcribe_audio(config, source.strip())
+            question = args.get("question") or args.get("prompt")
+            return describe_image(config, source.strip(), question if isinstance(question, str) else "")
+        if not isinstance(text, str) or not text.strip():
+            key = "text" if name == "text_to_speech" else "prompt"
+            return f'Bad tool call. {name} needs {{"{key}": "..."}}.'
+        if name == "generate_image":
+            return generate_image(config, text.strip(), path, args.get("size"))
+        if name == "generate_video":
+            duration = args.get("duration")
+            if isinstance(duration, str) and duration.isdigit():
+                duration = int(duration)
+            return generate_video(config, text.strip(), path, duration)
+        return text_to_speech(config, text.strip(), path, args.get("voice"))
     return f"Unknown tool {name!r}. Available tools: {', '.join(sorted(TOOL_NAMES))}."
 
 
@@ -869,7 +1322,7 @@ def text_tool_calls(content):
     return calls
 
 
-def call_with_retries(config, messages, model, options, use_tools):
+def call_with_retries(config, messages, model, options, use_tools) -> dict:
     # Retry on errors and on empty replies, which small models sometimes give.
     last_error = None
     for attempt in range(config["max_retries"] + 1):
@@ -877,6 +1330,13 @@ def call_with_retries(config, messages, model, options, use_tools):
             reply = call_model(config, messages, model, options, use_tools)
         except requests.ConnectionError:
             raise
+        except GatewayError as e:
+            # Bad key or no usable provider: retrying won't help, fall back now.
+            if e.status in (401, 403, 503):
+                raise
+            last_error = e
+            print(f"\n[model error: {e}, retrying]")
+            continue
         except (requests.RequestException, RuntimeError, ValueError) as e:
             last_error = e
             print(f"\n[model error: {e}, retrying]")
@@ -898,6 +1358,7 @@ def chat(config, history, user_input):
         use_tools = config["tools_enabled"] and route.get("tools", True)
         print(f"[{route_name} -> {model}]")
     else:
+        route_name = "fixed"
         route = {}
         model = config["model"]
         use_tools = config["tools_enabled"]
@@ -921,6 +1382,11 @@ def chat(config, history, user_input):
         if memory:
             system += "\n\n" + memory
 
+    def system_for(model):
+        # A system message replaces the Modelfile SYSTEM, so keep the model's own one first.
+        built_in = model_info(config, model).get("system", "").strip()
+        return (built_in + "\n\n" + system).strip() if built_in else system
+
     turn = [{"role": "user", "content": user_input}]
     past = history[-config["max_history"]:] if config["keep_history"] else []
     failed = set()
@@ -928,8 +1394,21 @@ def chat(config, history, user_input):
 
     try:
         for _ in range(config["max_steps"]):
-            messages = ([{"role": "system", "content": system}] if system else []) + past + turn
-            reply = call_with_retries(config, messages, model, options, use_tools)
+            sys_msg = system_for(model)
+            messages = ([{"role": "system", "content": sys_msg}] if sys_msg else []) + past + turn
+            try:
+                reply = call_with_retries(config, messages, model, options, use_tools)
+            except (requests.RequestException, RuntimeError, ValueError) as e:
+                # Cloud models fail when offline or out of quota: fall back to a local one.
+                if not (is_gateway(model) or model_info(config, model).get("remote_model")) or not route:
+                    raise
+                local = {**route, "model": None}
+                fallback = pick_model(config, local, [m for m in list_models(config) if not is_gateway(m)])
+                if same_model(fallback, model):
+                    raise
+                print(f"\n[{model} failed ({e}); using {fallback}]")
+                model = fallback
+                continue
             if use_tools and not reply.get("tool_calls"):
                 calls = text_tool_calls(reply["content"])
                 if calls:
@@ -952,16 +1431,34 @@ def chat(config, history, user_input):
                 if isinstance(args, str):
                     args = parse_value(args)
                 result = run_tool(config, fn.get("name", ""), args, failed)
-                turn.append({"role": "tool", "content": result, "tool_name": fn.get("name", "")})
+                message = {"role": "tool", "content": result, "tool_name": fn.get("name", "")}
+                if call.get("id"):
+                    message["tool_call_id"] = call["id"]
+                turn.append(message)
         else:
             print(f"\n[Stopped after {config['max_steps']} steps. Raise max_steps in the config if needed.]\n")
     finally:
         history.extend(turn)
         if brain:
             try:
-                brain.log_turn(user_input, turn, model, route_name if config["routing"] else "fixed")
+                brain.log_turn(user_input, turn, model, route_name)
             except Exception:
                 pass
+
+
+def receptionist_messages(config):
+    # Written by receptionist/receptionist.py, one JSON object per line.
+    path = os.path.join(workspace_dir(config), "receptionist", "messages.jsonl")
+    if not os.path.exists(path):
+        return []
+    with open(path) as f:
+        return [json.loads(line) for line in f if line.strip()]
+
+
+def format_message(m):
+    urgent = "URGENT " if m.get("urgent") else ""
+    number = f" ({m['callback_number']})" if m.get("callback_number") else ""
+    return f"{m.get('time', '?')}  {urgent}{m.get('caller_name', 'Unknown')}{number}: {m.get('message', '')}"
 
 
 def on_off(arg):
@@ -998,6 +1495,9 @@ def handle_command(line, config, history):
         installed = list_models(config)
         for name, route in config["routes"].items():
             print(f"  {name:6} -> {pick_model(config, route, installed):22} {route.get('description', '')}")
+    elif cmd == "backend" and arg in ("freellmapi", "ollama"):
+        config["backend"] = arg
+        print(f"Backend: {arg}")
     elif cmd == "system":
         config["system"] = arg
         print("System prompt updated." if arg else "System prompt cleared.")
@@ -1028,24 +1528,38 @@ def handle_command(line, config, history):
     elif cmd == "reload":
         config.clear()
         config.update(load_config())
-        _capabilities.clear()
+        _model_info.clear()
         print("Reloaded config.")
+    elif cmd == "messages":
+        messages = receptionist_messages(config)
+        if not messages:
+            print("No phone messages yet.")
+        elif not arg:
+            for m in messages[-20:]:
+                print(format_message(m))
+            print(f"\n{len(messages)} message(s). Ask about them with /messages <request>.")
+        else:
+            listing = "\n".join(format_message(m) for m in messages[-50:])
+            chat(config, history, f"Messages my phone receptionist took for me:\n{listing}\n\n{arg}")
     elif cmd == "clear":
         history.clear()
         print("Conversation cleared.")
-    elif cmd in ("brain", "learn", "follow", "remember", "recall") and not brain:
-        print("brain.py isn't available next to agent.py.")
-    elif cmd == "brain":
-        print(brain.status())
-    elif cmd == "learn":
-        print("Learning from recent sessions, files and news (this can take a few minutes)...")
-        print(brain.learn())
-    elif cmd == "follow":
-        brain.main(["follow", arg] if arg else ["follow"])
-    elif cmd == "remember" and arg:
-        print(brain.remember(arg, "fact"))
-    elif cmd == "recall" and arg:
-        brain.main(["search", arg])
+    elif cmd in ("brain", "learn", "follow", "remember", "recall"):
+        if not brain:
+            print("brain.py isn't available next to agent.py.")
+        elif cmd == "brain":
+            print(brain.status())
+        elif cmd == "learn":
+            print("Learning from recent sessions, files and news (this can take a few minutes)...")
+            print(brain.learn())
+        elif cmd == "follow":
+            brain.main(["follow", arg] if arg else ["follow"])
+        elif cmd == "remember" and arg:
+            print(brain.remember(arg, "fact"))
+        elif cmd == "recall" and arg:
+            brain.main(["search", arg])
+        else:
+            print("Unknown command. Type /help.")
     else:
         print("Unknown command. Type /help.")
 
@@ -1059,6 +1573,16 @@ def main():
     routing = f"auto ({', '.join(config['routes'])})" if config["routing"] else f"off, {config['model']}"
     print(f"Routing: {routing}   Tools: {'on' if config['tools_enabled'] else 'off'}"
           f"   Auto-approve: {config['auto_approve']}")
+    if gateway_on(config):
+        try:
+            usable = [m for m in gateway_models(config) if m.startswith("freellmapi/")]
+            print(f"FreeLLMAPI: {config['freellmapi_url']} ({len(usable)} cloud models ready)")
+            if not usable:
+                print("  No provider keys yet: add some on the Keys page of the FreeLLMAPI dashboard."
+                      " Local models are used until then.")
+        except (requests.RequestException, RuntimeError, ValueError) as e:
+            print(f"FreeLLMAPI not reachable ({e}). Start it with `npm run dev` in ~/freellmapi;"
+                  " local models are used until then.")
     print(f"Projects folder: {workspace_dir(config)}")
     print("Type /help for commands, /exit to quit.\n")
 

@@ -2,3 +2,6 @@ __pycache__/
 *.pyc
 *.bak
 *.bak[0-9]
+
+# Personal profile for the alaa-minimax model: stays on the phone, never public
+alaa-minimax/core.md
