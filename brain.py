@@ -42,6 +42,9 @@ DEFAULT_SETTINGS = {
     "learn_model": "qwen2.5:3b",
     "teacher_model": "claude-haiku-5-5",
     "use_teacher": True,
+    # First expert: the FreeLLMAPI gateway in Termux (free, fails over across providers).
+    "free_expert_model": "auto:smart",
+    "freellmapi_url": "http://127.0.0.1:3001",
     "gemini_model": "gemini-3.5-flash",
     # Tried in order when the main model is busy (503) or rate-limited (429).
     "gemini_fallbacks": ["gemini-3.5-flash-lite", "gemini-flash-latest", "gemini-flash-lite-latest"],
@@ -324,6 +327,25 @@ def _ask_claude(key, prompt):
     return "".join(b.get("text", "") for b in r.json().get("content", []))
 
 
+def freellmapi_key():
+    path = os.path.expanduser("~/.config/freellmapi/key")
+    if not os.path.exists(path):
+        return ""
+    with open(path) as f:
+        return f.read().strip()
+
+
+def _ask_freellmapi(key, prompt):
+    cfg = settings()
+    r = requests.post(f"{cfg['freellmapi_url']}/v1/chat/completions", timeout=120,
+                      headers={"Authorization": f"Bearer {key}"},
+                      json={"model": cfg["free_expert_model"],
+                            "messages": [{"role": "system", "content": EXPERT_SYSTEM},
+                                         {"role": "user", "content": prompt}]})
+    r.raise_for_status()
+    return r.json()["choices"][0]["message"].get("content") or ""
+
+
 def _ask_gemini(key, prompt):
     cfg = settings()
     r = None
@@ -344,8 +366,10 @@ def _ask_gemini(key, prompt):
 
 def experts():
     """Available online experts, in order of preference."""
-    # Gemini first (free tier); Claude only as a last resort, to save Claude credit.
+    # FreeLLMAPI first, then Gemini (free tier); Claude only as a last resort, to save Claude credit.
     found = []
+    if freellmapi_key():
+        found.append(("freellmapi", settings()["free_expert_model"], freellmapi_key(), _ask_freellmapi))
     if gemini_key():
         found.append(("gemini", settings()["gemini_model"], gemini_key(), _ask_gemini))
     if api_key():
